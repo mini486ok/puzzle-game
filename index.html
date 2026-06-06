@@ -312,13 +312,26 @@
     </div>
   </div>
 
-<!-- PeerJS 라이브러리: CDN 3중 폴백 (cdnjs → unpkg → jsDelivr) -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<!-- PeerJS 라이브러리 동적 로더: 검증된 CDN을 순차 시도 (cdnjs → unpkg → jsDelivr) -->
 <script>
-  if (typeof Peer === 'undefined') document.write('<script src="https:\/\/unpkg.com\/peerjs@1.5.4\/dist\/peerjs.min.js"><\/script>');
-</script>
-<script>
-  if (typeof Peer === 'undefined') document.write('<script src="https:\/\/cdn.jsdelivr.net\/npm\/peerjs@1.5.4\/dist\/peerjs.min.js"><\/script>');
+  window.__peerLibReady = new Promise((resolve, reject) => {
+    const urls = [
+      'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js',
+      'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js',
+      'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js'
+    ];
+    let i = 0;
+    (function tryNext(){
+      if (typeof Peer !== 'undefined') return resolve();
+      if (i >= urls.length) return reject(new Error('PeerJS: 모든 CDN 로드 실패'));
+      const s = document.createElement('script');
+      s.src = urls[i++];
+      s.onload  = () => (typeof Peer !== 'undefined') ? resolve() : tryNext();
+      s.onerror = () => tryNext();
+      document.head.appendChild(s);
+    })();
+  });
+  window.__peerLibReady.catch(()=>{});   // 미처리 rejection 경고 방지 (실제 처리는 버튼 클릭 시)
 </script>
 
 <script>
@@ -513,16 +526,41 @@
     peer=null;
   }
 
+  // 라이브러리가 아직 로딩 중이면 기다렸다가 진행 (버튼은 항상 활성 상태 유지)
+  async function ensurePeerLib(){
+    if(typeof Peer !== 'undefined') return true;
+    $('entryErr').textContent = '네트워크 라이브러리 로딩 중...';
+    try{
+      await Promise.race([
+        window.__peerLibReady,
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), 10000))
+      ]);
+      $('entryErr').textContent = '';
+      return true;
+    }catch(e){
+      $('entryErr').textContent = '⚠️ 네트워크 라이브러리(PeerJS)를 불러오지 못했습니다. 인터넷 연결을 확인하거나, 사내망이라면 CDN 차단 여부를 확인해주세요.';
+      return false;
+    }
+  }
+
   // ── 방 만들기 (방장) ──
-  function createRoom(attempt=0){
+  async function createRoom(attempt=0){
     if(!validateName()) return;
-    if(typeof Peer === 'undefined'){ $('entryErr').textContent='네트워크 라이브러리(PeerJS) 로드에 실패했습니다. 인터넷 연결을 확인 후 새로고침해주세요.'; return; }
     $('createBtn').disabled = true;
+    if(!(await ensurePeerLib())){ $('createBtn').disabled = false; return; }
     $('entryErr').textContent = '방을 만드는 중...';
     roomCode = randCode();
     peer = new Peer(PREFIX + roomCode, { debug: 1 });
 
+    // 신호 서버 응답이 없을 때 버튼이 영원히 잠기지 않도록 타임아웃
+    const createTimeout = setTimeout(()=>{
+      $('entryErr').textContent = '방 생성에 실패했습니다 (신호 서버 연결 시간 초과). 인터넷 연결을 확인해주세요. 사내망에서는 WebRTC가 차단될 수 있습니다.';
+      $('createBtn').disabled = false;
+      destroyPeer();
+    }, 15000);
+
     peer.on('open', ()=>{
+      clearTimeout(createTimeout);
       isHost = true; myId = 'P0';
       G.status='lobby'; G.maxPlayers=4; G.round=1; G.participants=[];
       G.players.clear();
@@ -535,6 +573,7 @@
     });
     peer.on('connection', conn => hostHandleConn(conn));
     peer.on('error', err => {
+      clearTimeout(createTimeout);
       if(err.type === 'unavailable-id' && attempt < 3){
         try{ peer.destroy(); }catch(e){}
         createRoom(attempt+1);            // 코드 충돌 → 새 코드로 재시도
@@ -547,12 +586,12 @@
   }
 
   // ── 참가하기 (게스트) ──
-  function joinRoom(){
+  async function joinRoom(){
     if(!validateName()) return;
-    if(typeof Peer === 'undefined'){ $('entryErr').textContent='네트워크 라이브러리(PeerJS) 로드에 실패했습니다. 인터넷 연결을 확인 후 새로고침해주세요.'; return; }
     const code = $('codeInput').value.trim().toUpperCase();
     if(code.length !== 4){ $('entryErr').textContent='초대 코드 4자리를 입력해주세요.'; return; }
     $('joinBtn').disabled = true;
+    if(!(await ensurePeerLib())){ $('joinBtn').disabled = false; return; }
     $('entryErr').textContent = '방에 연결하는 중...';
     roomCode = code; isHost = false;
     peer = new Peer({ debug: 1 });
@@ -982,13 +1021,7 @@
     }
   }
 
-  // 라이브러리 로드 실패 안내
-  window.addEventListener('load', ()=>{
-    if(typeof Peer === 'undefined'){
-      $('entryErr').textContent='⚠️ 네트워크 라이브러리(PeerJS) 로드에 실패했습니다. 인터넷 연결을 확인하고 새로고침해주세요.';
-      $('createBtn').disabled=true; $('joinBtn').disabled=true;
-    }
-  });
+  // 라이브러리 로드 실패 시에도 버튼은 비활성화하지 않음 — 클릭 시 ensurePeerLib가 대기/재시도/안내 처리
 })();
 </script>
 </body>
