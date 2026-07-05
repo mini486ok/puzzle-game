@@ -250,7 +250,7 @@
       </div>
       <div class="err" id="entryErr"></div>
       <p class="notice">
-        ※ 같은 페이지에 접속한 사람끼리 <b>초대 코드</b>로 같은 방에 모입니다 (브라우저 간 P2P 직접 연결).<br>
+        ※ 같은 페이지에 접속한 사람끼리 <b>초대 코드</b>로 같은 방에 모입니다 (공용 중계 서버 경유 — 어떤 네트워크에서도 연결됩니다).<br>
         ※ 입력한 ID와 기록은 같은 방의 다른 참가자에게 공개됩니다.<br>
         ※ <b>방장이 페이지를 닫으면 방이 사라지니</b>, 게임이 끝날 때까지 방장은 페이지를 유지해주세요.
       </p>
@@ -312,26 +312,26 @@
     </div>
   </div>
 
-<!-- PeerJS 라이브러리 동적 로더: 검증된 CDN을 순차 시도 (cdnjs → unpkg → jsDelivr) -->
+<!-- MQTT 라이브러리 동적 로더: 검증된 CDN을 순차 시도 (unpkg → jsDelivr → cdnjs) -->
 <script>
-  window.__peerLibReady = new Promise((resolve, reject) => {
+  window.__mqttLibReady = new Promise((resolve, reject) => {
     const urls = [
-      'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js',
-      'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js',
-      'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js'
+      'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js',
+      'https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js'
     ];
     let i = 0;
     (function tryNext(){
-      if (typeof Peer !== 'undefined') return resolve();
-      if (i >= urls.length) return reject(new Error('PeerJS: 모든 CDN 로드 실패'));
+      if (typeof mqtt !== 'undefined') return resolve();
+      if (i >= urls.length) return reject(new Error('mqtt.js: 모든 CDN 로드 실패'));
       const s = document.createElement('script');
       s.src = urls[i++];
-      s.onload  = () => (typeof Peer !== 'undefined') ? resolve() : tryNext();
+      s.onload  = () => (typeof mqtt !== 'undefined') ? resolve() : tryNext();
       s.onerror = () => tryNext();
       document.head.appendChild(s);
     })();
   });
-  window.__peerLibReady.catch(()=>{});   // 미처리 rejection 경고 방지 (실제 처리는 버튼 클릭 시)
+  window.__mqttLibReady.catch(()=>{});   // 미처리 rejection 경고 방지 (실제 처리는 버튼 클릭 시)
 </script>
 
 <script>
@@ -339,13 +339,25 @@
   'use strict';
   const $ = id => document.getElementById(id);
   const N = 4;
-  const PREFIX = 'p15z-krri-';   // PeerJS ID 충돌 방지용 네임스페이스
+  const NSTOPIC = 'p15z-krri/v2';        // MQTT 토픽 네임스페이스 (타 서비스와 충돌 방지)
+  const BROKERS = [                      // 공용 MQTT 브로커 (WSS) — 순차/병렬 failover
+    'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker.hivemq.com:8884/mqtt',
+    'wss://test.mosquitto.org:8081'
+  ];
+  const tPresence = c => `${NSTOPIC}/${c}/presence`;   // retained: 방 존재 여부 {alive}
+  const tHost     = c => `${NSTOPIC}/${c}/h`;          // 게스트 → 방장
+  const tAll      = c => `${NSTOPIC}/${c}/all`;        // 방장 → 전체
+  const tGuest    = (c,g) => `${NSTOPIC}/${c}/g/${g}`; // 방장 → 특정 게스트
   const colors = ['#ff5d3a','#3ddc97','#ffd23f','#5aa9ff'];
 
   // ───────────────── 공통 상태 ─────────────────
   let myName='', myId='', roomCode='', isHost=false;
-  let peer=null, hostConn=null;          // 게스트: 방장과의 연결
-  const conns = new Map();               // 방장: 게스트 id → DataConnection
+  let client=null;                       // MQTT 클라이언트 (방장/게스트 공용)
+  let myGid='';                          // 브로커 토픽 주소지정용 내 고유 id
+  const pidToGid = new Map();            // 방장: 플레이어 id → 게스트 토픽 id
+  let guestJoinTO=null;                  // 게스트: joined 응답 대기 타임아웃
+  let hostAliveTimer=null;               // 게스트: 방장 이탈 유예 타이머
   let phase='entry';                     // entry|lobby|countdown|playing|done
   let finished=false, gaveUp=false, localStartTs=0;
   let lastLobby={players:[],maxPlayers:4};   // 게스트가 마지막으로 받은 로비 상태
@@ -362,6 +374,7 @@
   };
   const escapeHtml = s => String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const randCode = () => Array.from({length:4}, () => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.floor(Math.random()*31)]).join('');
+  const randId = () => Math.random().toString(36).slice(2,10) + Math.random().toString(36).slice(2,6);
   function show(scr){ document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); $(scr).classList.add('active'); }
 
   // ───────────────── 시드 기반 셔플 (모두 동일한 문제) ─────────────────
@@ -514,124 +527,230 @@
   }
   const stopClock=()=>{ if(rafTimer) cancelAnimationFrame(rafTimer); };
 
-  // ═════════════════ 네트워크 (PeerJS / WebRTC P2P) ═════════════════
-  // 방장의 브라우저가 서버 역할: 게스트는 방장에게만 연결하고,
+  // ═════════════════ 네트워크 (공용 MQTT 중계 서버 / WSS) ═════════════════
+  // 방장의 브라우저가 서버 역할: 게스트는 방장에게만 메시지를 보내고,
   // 방장이 전체 상태를 모아 모든 참가자에게 실시간으로 중계합니다.
+  // 전송은 공용 MQTT 브로커(웹소켓)를 경유하므로 NAT/방화벽과 무관하게
+  // 어떤 네트워크(Wi-Fi ↔ LTE 등)에서도 연결됩니다.
 
-  function destroyPeer(){
-    try{ hostConn?.close(); }catch(e){}
-    conns.forEach(c=>{ try{c.close();}catch(e){} });
-    conns.clear(); hostConn=null;
-    try{ peer?.destroy(); }catch(e){}
-    peer=null;
+  function mqttConnect(url, extra){
+    return mqtt.connect(url, {
+      keepalive: 15, connectTimeout: 6000, reconnectPeriod: 2000,
+      clean: true, clientId: 'p15z_' + randId(), ...(extra||{})
+    });
+  }
+  // 연결 성공한 클라이언트 또는 null 반환 (실패 시 자동 정리)
+  function tryConnect(url, will){
+    return new Promise(res=>{
+      let c;
+      try{ c = mqttConnect(url, will ? {will} : {}); }catch(e){ res(null); return; }
+      let settled=false;
+      const to = setTimeout(()=>{ if(!settled){ settled=true; try{c.end(true);}catch(e){} res(null); } }, 8000);
+      c.once('connect', ()=>{ if(!settled){ settled=true; clearTimeout(to); res(c); } });
+      c.once('error',   ()=>{ if(!settled){ settled=true; clearTimeout(to); try{c.end(true);}catch(e){} res(null); } });
+    });
+  }
+
+  function netDestroy(){
+    if(hostAliveTimer){ clearTimeout(hostAliveTimer); hostAliveTimer=null; }
+    if(guestJoinTO){ clearTimeout(guestJoinTO); guestJoinTO=null; }
+    const c = client; client = null;
+    if(!c) return;
+    try{
+      if(c.connected){
+        if(isHost && roomCode) c.publish(tPresence(roomCode), '', {retain:true});   // 방 팻말 제거
+        else if(roomCode && myGid) c.publish(tHost(roomCode), JSON.stringify({t:'gone', from:myGid}));
+      }
+    }catch(e){}
+    try{ c.removeAllListeners('message'); }catch(e){}
+    try{ c.connected ? c.end() : c.end(true); }catch(e){}   // 남은 발행분 전송 후 종료
+  }
+
+  function publishPresence(){
+    try{ if(client?.connected && isHost && roomCode)
+      client.publish(tPresence(roomCode), JSON.stringify({alive:true, ts:Date.now()}), {retain:true});
+    }catch(e){}
+  }
+  function attachNetIndicators(c){
+    c.on('offline', ()=>{ $('connDot').classList.remove('on'); });
+    c.on('connect', ()=>{ $('connDot').classList.add('on'); });
   }
 
   // 라이브러리가 아직 로딩 중이면 기다렸다가 진행 (버튼은 항상 활성 상태 유지)
-  async function ensurePeerLib(){
-    if(typeof Peer !== 'undefined') return true;
+  async function ensureNetLib(){
+    if(typeof mqtt !== 'undefined') return true;
     $('entryErr').textContent = '네트워크 라이브러리 로딩 중...';
     try{
       await Promise.race([
-        window.__peerLibReady,
+        window.__mqttLibReady,
         new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), 10000))
       ]);
       $('entryErr').textContent = '';
       return true;
     }catch(e){
-      $('entryErr').textContent = '⚠️ 네트워크 라이브러리(PeerJS)를 불러오지 못했습니다. 인터넷 연결을 확인하거나, 사내망이라면 CDN 차단 여부를 확인해주세요.';
+      $('entryErr').textContent = '⚠️ 네트워크 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하거나, 사내망이라면 CDN 차단 여부를 확인해주세요.';
       return false;
     }
   }
 
-  // ── 방 만들기 (방장) ──
-  async function createRoom(attempt=0){
-    if(!validateName()) return;
-    $('createBtn').disabled = true;
-    if(!(await ensurePeerLib())){ $('createBtn').disabled = false; return; }
-    $('entryErr').textContent = '방을 만드는 중...';
-    roomCode = randCode();
-    peer = new Peer(PREFIX + roomCode, { debug: 1 });
-
-    // 신호 서버 응답이 없을 때 버튼이 영원히 잠기지 않도록 타임아웃
-    const createTimeout = setTimeout(()=>{
-      $('entryErr').textContent = '방 생성에 실패했습니다 (신호 서버 연결 시간 초과). 인터넷 연결을 확인해주세요. 사내망에서는 WebRTC가 차단될 수 있습니다.';
-      $('createBtn').disabled = false;
-      destroyPeer();
-    }, 15000);
-
-    peer.on('open', ()=>{
-      clearTimeout(createTimeout);
-      isHost = true; myId = 'P0';
-      G.status='lobby'; G.maxPlayers=4; G.round=1; G.participants=[];
-      G.players.clear();
-      G.players.set(myId, freshPlayer(myId, myName));
-      $('entryErr').textContent='';
-      $('createBtn').disabled = false;
-      enterLobbyUI();
-      hostBroadcastLobby();
-      attachPeerCommon();
-    });
-    peer.on('connection', conn => hostHandleConn(conn));
-    peer.on('error', err => {
-      clearTimeout(createTimeout);
-      if(err.type === 'unavailable-id' && attempt < 3){
-        try{ peer.destroy(); }catch(e){}
-        createRoom(attempt+1);            // 코드 충돌 → 새 코드로 재시도
-        return;
-      }
-      $('createBtn').disabled = false;
-      $('entryErr').textContent = netErrMsg(err);
-      destroyPeer();
+  // 해당 코드의 방이 이 브로커에 이미 존재하는지 (retained presence 확인)
+  function checkRoomInUse(c, code){
+    return new Promise(res=>{
+      let used=false;
+      const handler=(tp,pl)=>{
+        if(tp!==tPresence(code) || !pl || pl.length===0) return;
+        try{ used = !!JSON.parse(pl.toString()).alive; }catch(e){}
+      };
+      c.on('message', handler);
+      c.subscribe(tPresence(code));
+      setTimeout(()=>{
+        c.removeListener('message', handler);
+        try{ c.unsubscribe(tPresence(code)); }catch(e){}
+        res(used);
+      }, 900);
     });
   }
 
-  // ── 참가하기 (게스트) ──
+  // ── 방 만들기 (방장) ──
+  async function createRoom(){
+    if(!validateName()) return;
+    $('createBtn').disabled = true;
+    if(!(await ensureNetLib())){ $('createBtn').disabled = false; return; }
+    $('entryErr').textContent = '중계 서버에 연결하는 중...';
+    netDestroy();
+    myGid = randId();
+
+    let c=null, code='';
+    for(const url of BROKERS){
+      for(let attempt=0; attempt<3 && !c; attempt++){
+        const tryCode = randCode();
+        // 비정상 종료 시 브로커가 대신 "방 없음" 팻말을 남기도록 유언(LWT) 등록
+        const will = { topic:tPresence(tryCode), payload:JSON.stringify({alive:false}), qos:0, retain:true };
+        const cand = await tryConnect(url, will);
+        if(!cand) break;                                       // 브로커 접속 불가 → 다음 브로커
+        if(await checkRoomInUse(cand, tryCode)){ try{cand.end();}catch(e){} continue; }  // 코드 충돌(희박)
+        c = cand; code = tryCode;
+      }
+      if(c) break;
+    }
+    if(!c){
+      $('entryErr').textContent = '⚠️ 중계 서버에 연결할 수 없습니다. 인터넷 연결을 확인한 뒤 다시 시도해주세요.';
+      $('createBtn').disabled = false;
+      return;
+    }
+
+    client = c; roomCode = code;
+    isHost = true; myId = 'P0'; guestSeq = 0; pidToGid.clear();
+    G.status='lobby'; G.maxPlayers=4; G.round=1; G.participants=[];
+    G.players.clear();
+    G.players.set(myId, freshPlayer(myId, myName));
+    client.subscribe(tHost(roomCode));
+    client.on('message', hostOnMessage);
+    client.on('connect', publishPresence);   // 재접속 시 방 팻말 재게시
+    attachNetIndicators(client);
+    publishPresence();
+    $('entryErr').textContent='';
+    $('createBtn').disabled = false;
+    enterLobbyUI();
+  }
+
+  // ── 참가하기: 모든 브로커에서 동시에 방을 탐색 ──
+  function probeRoom(code){
+    return new Promise(resolve=>{
+      let pending = BROKERS.length, winner = null;
+      const finish = c => { if(!winner && c){ winner = c; resolve(c); } else if(c){ try{c.end();}catch(e){} } };
+      const fail = () => { if(--pending===0 && !winner) resolve(null); };
+      BROKERS.forEach(async url=>{
+        // 비정상 이탈 시 방장이 알 수 있도록 유언(LWT) 등록
+        const will = { topic:tHost(code), payload:JSON.stringify({t:'gone', from:myGid}), qos:0, retain:false };
+        const c = await tryConnect(url, will);
+        if(!c){ fail(); return; }
+        if(winner){ try{c.end();}catch(e){} fail(); return; }
+        let settled=false;
+        const giveup = setTimeout(()=>{                       // retained 미수신 → 이 브로커엔 방 없음
+          if(!settled){ settled=true; c.removeListener('message', handler); try{c.end();}catch(e){} fail(); }
+        }, 3500);
+        const handler = (tp,pl)=>{
+          if(tp!==tPresence(code) || settled) return;
+          let alive=false;
+          if(pl && pl.length>0){ try{ alive = !!JSON.parse(pl.toString()).alive; }catch(e){} }
+          settled=true; clearTimeout(giveup);
+          c.removeListener('message', handler);
+          if(alive){ finish(c); if(winner!==c){ fail(); } }
+          else { try{c.end();}catch(e){} fail(); }            // 방장이 떠난 방
+        };
+        c.on('message', handler);
+        c.subscribe(tPresence(code));
+      });
+    });
+  }
+
   async function joinRoom(){
     if(!validateName()) return;
     const code = $('codeInput').value.trim().toUpperCase();
     if(code.length !== 4){ $('entryErr').textContent='초대 코드 4자리를 입력해주세요.'; return; }
     $('joinBtn').disabled = true;
-    if(!(await ensurePeerLib())){ $('joinBtn').disabled = false; return; }
-    $('entryErr').textContent = '방에 연결하는 중...';
-    roomCode = code; isHost = false;
-    peer = new Peer({ debug: 1 });
+    if(!(await ensureNetLib())){ $('joinBtn').disabled = false; return; }
+    $('entryErr').textContent = '방을 찾는 중...';
+    netDestroy();
+    myGid = randId();
 
-    const joinTimeout = setTimeout(()=>{
+    const c = await probeRoom(code);
+    if(!c){
+      $('entryErr').textContent = '해당 코드의 방을 찾을 수 없습니다. 코드와 방장 접속 상태를 확인해주세요.';
+      $('joinBtn').disabled = false;
+      return;
+    }
+    client = c; roomCode = code; isHost = false;
+    $('entryErr').textContent = '방에 연결하는 중...';
+
+    let joinRetry = null;
+    guestJoinTO = setTimeout(()=>{
+      guestJoinTO=null;
+      if(joinRetry){ clearInterval(joinRetry); joinRetry=null; }
       $('entryErr').textContent='방 연결에 실패했습니다. 코드를 확인하거나, 방장이 페이지를 열어둔 상태인지 확인해주세요.';
-      $('joinBtn').disabled=false; destroyPeer();
+      $('joinBtn').disabled=false; netDestroy();
     }, 12000);
 
-    peer.on('open', ()=>{
-      hostConn = peer.connect(PREFIX + code, { reliable: true });
-      hostConn.on('open', ()=>{ hostConn.send({t:'join', name: myName}); });
-      hostConn.on('data', msg => { clearTimeout(joinTimeout); guestHandleMsg(msg); });
-      hostConn.on('close', ()=>{
-        clearTimeout(joinTimeout);
-        if(phase!=='entry'){
-          alert('방장과의 연결이 끊어졌습니다. 처음 화면으로 돌아갑니다.');
-          leave();
-        }
-      });
-      attachPeerCommon();
+    client.on('message', (tp,pl)=>{
+      if(joinRetry && tp===tGuest(code, myGid)){ clearInterval(joinRetry); joinRetry=null; }
+      guestOnMessage(tp,pl);
     });
-    peer.on('error', err => {
-      clearTimeout(joinTimeout);
-      $('joinBtn').disabled = false;
-      $('entryErr').textContent = (err.type==='peer-unavailable')
-        ? '해당 코드의 방을 찾을 수 없습니다. 코드와 방장 접속 상태를 확인해주세요.'
-        : netErrMsg(err);
-      destroyPeer();
+    attachNetIndicators(client);
+    // 구독 완료(SUBACK) 후에 join 전송 — 응답 유실 방지. 미응답 시 3초 간격 재전송(방장은 중복 join 무시)
+    const sendJoin = ()=>{ try{ if(client?.connected) client.publish(tHost(code), JSON.stringify({t:'join', name:myName, from:myGid})); }catch(e){} };
+    client.subscribe([tAll(code), tGuest(code, myGid), tPresence(code)], (err)=>{
+      if(err){
+        if(guestJoinTO){ clearTimeout(guestJoinTO); guestJoinTO=null; }
+        $('entryErr').textContent='방 연결에 실패했습니다. 잠시 후 다시 시도해주세요.';
+        $('joinBtn').disabled=false; netDestroy();
+        return;
+      }
+      sendJoin();
+      joinRetry = setInterval(sendJoin, 3000);
     });
   }
 
-  function attachPeerCommon(){
-    // 신호 서버와 연결이 잠시 끊겨도 자동 재접속 (P2P 데이터 연결은 유지됨)
-    peer.on('disconnected', ()=>{ try{ if(peer && !peer.destroyed) peer.reconnect(); }catch(e){} });
-  }
-  function netErrMsg(err){
-    if(err.type==='network') return '신호 서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.';
-    if(err.type==='browser-incompatible') return '이 브라우저는 WebRTC를 지원하지 않습니다. 최신 Chrome/Safari/Edge를 사용해주세요.';
-    return '연결 오류가 발생했습니다 (' + (err.type||'unknown') + '). 잠시 후 다시 시도해주세요.';
+  // 게스트: 방장 생존 감시 (retained presence 구독)
+  function guestWatchPresence(pl){
+    if(pl && pl.length>0){
+      let alive=false;
+      try{ alive = !!JSON.parse(pl.toString()).alive; }catch(e){}
+      if(alive){ if(hostAliveTimer){ clearTimeout(hostAliveTimer); hostAliveTimer=null; } return; }
+      // LWT(비정상 이탈) → 방장 재접속 유예 20초
+      if(phase==='entry' || hostAliveTimer) return;
+      hostAliveTimer = setTimeout(()=>{
+        hostAliveTimer=null;
+        alert('방장과의 연결이 끊어졌습니다. 처음 화면으로 돌아갑니다.');
+        leave();
+      }, 20000);
+      return;
+    }
+    // 빈 payload = 방장이 방을 정상 종료
+    if(phase!=='entry'){
+      alert('방장이 방을 닫았습니다. 처음 화면으로 돌아갑니다.');
+      leave();
+    }
   }
   function validateName(){
     myName = $('nameInput').value.trim();
@@ -643,50 +762,58 @@
 
   // ───────────────── 방장: 수신 처리 & 중계 ─────────────────
   let guestSeq = 0;
-  function hostHandleConn(conn){
-    conn.on('data', msg => {
-      if(!msg || typeof msg !== 'object') return;
-      if(msg.t === 'join'){
-        if(G.status !== 'lobby'){ conn.send({t:'busy'}); setTimeout(()=>conn.close(), 300); return; }
-        const count = alivePlayers().length;
-        if(count >= G.maxPlayers){ conn.send({t:'full', max:G.maxPlayers}); setTimeout(()=>conn.close(), 300); return; }
-        const id = 'P' + (++guestSeq);
-        conn._pid = id;
-        conns.set(id, conn);
-        G.players.set(id, freshPlayer(id, String(msg.name||'???').slice(0,10)));
-        conn.send({t:'joined', yourId:id, roomCode});
-        hostBroadcastLobby();
-        return;
-      }
-      const id = conn._pid;
-      if(!id || !G.players.has(id)) return;
-      if(msg.t === 'state'){
-        const p = G.players.get(id);
-        if(Array.isArray(msg.grid) && msg.grid.length===16) p.grid = msg.grid;
-        p.moves = msg.moves|0; p.progress = msg.progress|0;
-        if(msg.done){ p.done=true; p.gaveUp=!!msg.gaveUp; p.timeMs = msg.gaveUp ? null : msg.timeMs; }
-        hostBroadcastGameThrottled();
-        hostCheckEnd();
-      }
-    });
-    conn.on('close', ()=>{
-      const id = conn._pid;
-      if(!id) return;
-      conns.delete(id);
+  const gidToPid = gid => { for(const [p,g] of pidToGid) if(g===gid) return p; return null; };
+  function sendToGid(gid, msg){
+    try{ if(client?.connected) client.publish(tGuest(roomCode, gid), JSON.stringify(msg)); }catch(e){}
+  }
+  function hostOnMessage(tp, pl){
+    if(!roomCode || tp !== tHost(roomCode)) return;
+    let msg=null; try{ msg = JSON.parse(pl.toString()); }catch(e){ return; }
+    if(!msg || typeof msg !== 'object' || !msg.from) return;
+    const gid = String(msg.from);
+
+    if(msg.t === 'join'){
+      const existing = gidToPid(gid);
+      if(existing){ sendToGid(gid, {t:'joined', yourId:existing, roomCode}); return; }   // join 재전송 대응
+      if(G.status !== 'lobby'){ sendToGid(gid, {t:'busy'}); return; }
+      if(alivePlayers().length >= G.maxPlayers){ sendToGid(gid, {t:'full', max:G.maxPlayers}); return; }
+      const id = 'P' + (++guestSeq);
+      pidToGid.set(id, gid);
+      G.players.set(id, freshPlayer(id, String(msg.name||'???').slice(0,10)));
+      sendToGid(gid, {t:'joined', yourId:id, roomCode});
+      hostBroadcastLobby();
+      return;
+    }
+
+    const id = gidToPid(gid);
+    if(!id || !G.players.has(id)) return;
+    if(msg.t === 'state'){
+      const p = G.players.get(id);
+      if(Array.isArray(msg.grid) && msg.grid.length===16) p.grid = msg.grid;
+      p.moves = msg.moves|0; p.progress = msg.progress|0;
+      if(msg.done){ p.done=true; p.gaveUp=!!msg.gaveUp; p.timeMs = msg.gaveUp ? null : msg.timeMs; }
+      hostBroadcastGameThrottled();
+      hostCheckEnd();
+      return;
+    }
+    if(msg.t === 'gone'){                       // 게스트 이탈 (정상 퇴장 또는 LWT)
+      pidToGid.delete(id);
       if(G.status==='lobby'){
         G.players.delete(id);
         hostBroadcastLobby();
       } else if(G.players.has(id)){
-        const p = G.players.get(id);          // 게임 중 이탈 → DNF 처리
+        const p = G.players.get(id);            // 게임 중 이탈 → DNF 처리
         if(!p.done){ p.done=true; p.gaveUp=true; p.timeMs=null; }
         hostBroadcastGameThrottled();
         hostCheckEnd();
       }
-    });
+    }
   }
   const alivePlayers = () => [...G.players.values()].sort((a,b)=>a.joinedAt-b.joinedAt);
 
-  function hostSendAll(msg){ conns.forEach(c=>{ try{ if(c.open) c.send(msg); }catch(e){} }); }
+  function hostSendAll(msg){
+    try{ if(client?.connected) client.publish(tAll(roomCode), JSON.stringify(msg)); }catch(e){}
+  }
   function hostBroadcastLobby(){
     const list = alivePlayers().map(p=>({id:p.id, name:p.name}));
     const payload = {t:'lobby', players:list, maxPlayers:G.maxPlayers};
@@ -721,21 +848,31 @@
   }
 
   // ───────────────── 게스트: 수신 처리 ─────────────────
+  function guestOnMessage(tp, pl){
+    if(!roomCode) return;
+    if(tp === tPresence(roomCode)){ guestWatchPresence(pl); return; }
+    if(tp !== tAll(roomCode) && tp !== tGuest(roomCode, myGid)) return;
+    let msg=null; try{ msg = JSON.parse(pl.toString()); }catch(e){ return; }
+    guestHandleMsg(msg);
+  }
   function guestHandleMsg(msg){
     if(!msg || typeof msg !== 'object') return;
     switch(msg.t){
       case 'joined':
+        if(guestJoinTO){ clearTimeout(guestJoinTO); guestJoinTO=null; }
         myId = msg.yourId;
         $('joinBtn').disabled=false; $('entryErr').textContent='';
         enterLobbyUI();
         break;
       case 'full':
+        if(guestJoinTO){ clearTimeout(guestJoinTO); guestJoinTO=null; }
         $('entryErr').textContent=`방이 가득 찼습니다. (최대 ${msg.max}명)`;
-        $('joinBtn').disabled=false; destroyPeer();
+        $('joinBtn').disabled=false; netDestroy();
         break;
       case 'busy':
+        if(guestJoinTO){ clearTimeout(guestJoinTO); guestJoinTO=null; }
         $('entryErr').textContent='이미 게임이 진행 중인 방입니다.';
-        $('joinBtn').disabled=false; destroyPeer();
+        $('joinBtn').disabled=false; netDestroy();
         break;
       case 'lobby':    applyLobby(msg); break;
       case 'countdown':beginCountdown(msg.seed); break;
@@ -867,7 +1004,7 @@
           hostCheckEnd();
         }
       } else {
-        try{ if(hostConn?.open) hostConn.send(state); }catch(e){}
+        try{ if(client?.connected) client.publish(tHost(roomCode), JSON.stringify({...state, from:myGid})); }catch(e){}
       }
     };
     if(force || finished){ if(sendTimer){clearTimeout(sendTimer);sendTimer=null;} doSend(); return; }
@@ -956,24 +1093,24 @@
 
   // ───────────────── 나가기 ─────────────────
   function leave(){
-    stopClock(); releaseWake(); destroyPeer();
-    roomCode=''; myId=''; isHost=false; phase='entry';
+    stopClock(); releaseWake(); netDestroy();
+    roomCode=''; myId=''; myGid=''; isHost=false; phase='entry';
     finished=false; gaveUp=false; countdownRunning=false; grid=null;
     lastLobby={players:[],maxPlayers:4};
-    G.players.clear(); G.participants=[]; G.status='lobby'; guestSeq=0;
+    G.players.clear(); G.participants=[]; G.status='lobby'; guestSeq=0; pidToGid.clear();
     $('resultOverlay').classList.remove('show');
     $('createBtn').disabled=false; $('joinBtn').disabled=false;
     show('scr-entry');
   }
   $('exitBtn').addEventListener('click', ()=>{
-    if(isHost && conns.size>0 && !confirm('방장이 나가면 방이 사라집니다. 나갈까요?')) return;
+    if(isHost && pidToGid.size>0 && !confirm('방장이 나가면 방이 사라집니다. 나갈까요?')) return;
     leave();
   });
   $('leaveBtn').addEventListener('click', ()=>{
-    if(isHost && conns.size>0 && !confirm('방장이 나가면 방이 사라집니다. 나갈까요?')) return;
+    if(isHost && pidToGid.size>0 && !confirm('방장이 나가면 방이 사라집니다. 나갈까요?')) return;
     leave();
   });
-  window.addEventListener('beforeunload', ()=>{ try{ destroyPeer(); }catch(e){} });
+  window.addEventListener('beforeunload', ()=>{ try{ netDestroy(); }catch(e){} });
 
   // ───────────────── 모바일 안정성 ─────────────────
   let wakeLock=null;
@@ -982,7 +1119,7 @@
   document.addEventListener('visibilitychange', ()=>{
     if(document.visibilityState==='visible'){
       if(phase==='playing' && !finished) holdWake();
-      try{ if(peer && peer.disconnected && !peer.destroyed) peer.reconnect(); }catch(e){}
+      try{ if(client && !client.connected && !client.disconnecting) client.reconnect(); }catch(e){}
     }
   });
 
@@ -1021,7 +1158,7 @@
     }
   }
 
-  // 라이브러리 로드 실패 시에도 버튼은 비활성화하지 않음 — 클릭 시 ensurePeerLib가 대기/재시도/안내 처리
+  // 라이브러리 로드 실패 시에도 버튼은 비활성화하지 않음 — 클릭 시 ensureNetLib가 대기/재시도/안내 처리
 })();
 </script>
 </body>
