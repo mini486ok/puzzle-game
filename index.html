@@ -123,6 +123,18 @@
   .tile.shake{animation:shake .18s}
   @keyframes shake{25%{margin-left:3px}75%{margin-left:-3px}}
 
+  /* 1등 확정 배너 (비차단) */
+  .firstbar{
+    background:linear-gradient(180deg,#2a2616,var(--panel));border:1px solid var(--tile-correct);
+    border-radius:12px;padding:10px 12px;margin-bottom:12px;
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    box-shadow:0 8px 20px rgba(0,0,0,.3);animation:slidein .3s;
+  }
+  .firstbar .fb-text{flex:1;font-size:13px;min-width:130px;line-height:1.5}
+  .firstbar .fb-text b{color:var(--tile-correct)}
+  .firstbar .fb-btns{display:flex;gap:6px}
+  .firstbar button{padding:9px 12px;font-size:12px;letter-spacing:0}
+
   /* 상대 진행 현황: 실시간 미니 보드 */
   .rivals{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}
   .mini{
@@ -185,6 +197,7 @@
   .rank-row:nth-child(4){animation-delay:.3s}.rank-row:nth-child(5){animation-delay:.4s}
   @keyframes slidein{from{transform:translateY(14px);opacity:0}}
   .rank-row.first{border-color:var(--tile-correct);background:linear-gradient(180deg,#2a2616,var(--panel))}
+  .rank-row.stop .rt{color:var(--tile-correct)}
   .medal{font-size:24px;width:34px;text-align:center;flex:none}
   .rank-row .rn{font-weight:700;font-size:16px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .rank-row .rt{font-family:'Major Mono Display',monospace;font-size:16px;color:var(--accent2)}
@@ -288,6 +301,13 @@
       <div class="stat"><div class="label">이동</div><div class="value" id="moves">0</div></div>
       <div class="stat"><div class="label">시간</div><div class="value" id="time">0:00.0</div></div>
     </div>
+    <div class="firstbar" id="firstBar" style="display:none">
+      <div class="fb-text" id="firstBarText"></div>
+      <div class="fb-btns">
+        <button class="primary" id="fbContinue">끝까지 도전</button>
+        <button id="fbStop">여기서 그만</button>
+      </div>
+    </div>
     <div class="board-frame"><div id="board"></div></div>
     <div class="rivals-title" id="rivalsTitle" style="display:none">상대방 화면 (실시간)</div>
     <div class="rivals" id="rivals"></div>
@@ -359,12 +379,12 @@
   let guestJoinTO=null;                  // 게스트: joined 응답 대기 타임아웃
   let hostAliveTimer=null;               // 게스트: 방장 이탈 유예 타이머
   let phase='entry';                     // entry|lobby|countdown|playing|done
-  let finished=false, gaveUp=false, localStartTs=0;
+  let finished=false, gaveUp=false, stoppedEarly=false, localStartTs=0;
   let lastLobby={players:[],maxPlayers:4};   // 게스트가 마지막으로 받은 로비 상태
 
   // 방장 권한 상태 (방장 브라우저가 서버 역할)
-  const G = { status:'lobby', maxPlayers:4, seed:0, round:1, participants:[], players:new Map() };
-  // players: id → {id, name, joinedAt, grid, moves, progress, done, timeMs, gaveUp, left}
+  const G = { status:'lobby', maxPlayers:4, seed:0, round:1, participants:[], players:new Map(), firstDone:false };
+  // players: id → {id, name, joinedAt, grid, moves, progress, done, timeMs, gaveUp, stopped, left}
 
   const fmtMs = ms => {
     if(ms == null) return 'DNF';
@@ -758,7 +778,7 @@
     $('entryErr').textContent='';
     return true;
   }
-  const freshPlayer = (id,name)=>({ id, name, joinedAt: Date.now(), grid:null, moves:0, progress:0, done:false, timeMs:null, gaveUp:false });
+  const freshPlayer = (id,name)=>({ id, name, joinedAt: Date.now(), grid:null, moves:0, progress:0, done:false, timeMs:null, gaveUp:false, stopped:false });
 
   // ───────────────── 방장: 수신 처리 & 중계 ─────────────────
   let guestSeq = 0;
@@ -791,7 +811,8 @@
       const p = G.players.get(id);
       if(Array.isArray(msg.grid) && msg.grid.length===16) p.grid = msg.grid;
       p.moves = msg.moves|0; p.progress = msg.progress|0;
-      if(msg.done){ p.done=true; p.gaveUp=!!msg.gaveUp; p.timeMs = msg.gaveUp ? null : msg.timeMs; }
+      if(msg.done){ p.done=true; p.gaveUp=!!msg.gaveUp; p.stopped=!!msg.stopped; p.timeMs = (msg.gaveUp||msg.stopped) ? null : msg.timeMs; }
+      hostCheckFirst();
       hostBroadcastGameThrottled();
       hostCheckEnd();
       return;
@@ -830,18 +851,29 @@
       gbDirty=false;
       const payload = {t:'game', players: alivePlayers().map(p=>({
         id:p.id, name:p.name, grid:p.grid, moves:p.moves, progress:p.progress,
-        done:p.done, gaveUp:p.gaveUp, timeMs:p.timeMs
+        done:p.done, gaveUp:p.gaveUp, stopped:p.stopped, timeMs:p.timeMs
       }))};
       hostSendAll(payload);
       applyGame(payload);                      // 방장 본인 화면도 갱신
     }, 120);                                   // 실시간 중계 (~0.1초)
+  }
+  // 이번 라운드 최초의 정상 완주자(1등) 감지 → 전원에게 1회 방송
+  function hostCheckFirst(){
+    if(G.status!=='playing' || G.firstDone) return;
+    const w = G.participants.map(id=>G.players.get(id)).filter(Boolean)
+      .find(p=>p.done && !p.gaveUp && !p.stopped);
+    if(!w) return;
+    G.firstDone = true;
+    const payload = {t:'first', name:w.name, timeMs:w.timeMs};
+    hostSendAll(payload);
+    applyFirst(payload);                       // 방장 본인 화면도 반영
   }
   function hostCheckEnd(){
     if(G.status!=='playing') return;
     const parts = G.participants.map(id=>G.players.get(id)).filter(Boolean);
     if(parts.length && parts.every(p=>p.done)){
       G.status='done';
-      const payload = {t:'result', list: parts.map(p=>({name:p.name, id:p.id, timeMs:p.timeMs, moves:p.moves, gaveUp:p.gaveUp}))};
+      const payload = {t:'result', list: parts.map(p=>({name:p.name, id:p.id, timeMs:p.timeMs, moves:p.moves, gaveUp:p.gaveUp, stopped:p.stopped, progress:p.progress}))};
       hostSendAll(payload);
       applyResult(payload);
     }
@@ -877,6 +909,7 @@
       case 'lobby':    applyLobby(msg); break;
       case 'countdown':beginCountdown(msg.seed); break;
       case 'game':     applyGame(msg); break;
+      case 'first':    applyFirst(msg); break;
       case 'result':   applyResult(msg); break;
       case 'relobby':  enterLobbyUI(); break;
     }
@@ -884,9 +917,10 @@
 
   // ───────────────── 공통 화면 갱신 ─────────────────
   function enterLobbyUI(){
-    phase='lobby'; finished=false; gaveUp=false; moves=0; grid=null;
+    phase='lobby'; finished=false; gaveUp=false; stoppedEarly=false; moves=0; grid=null;
     $('moves').textContent='0'; $('time').textContent='0:00.0';
     $('giveupBtn').style.display='block'; $('waitOthers').style.display='none';
+    $('firstBar').style.display='none';
     $('resultOverlay').classList.remove('show');
     $('roomCodeView').innerHTML = `${roomCode}<small>초대 코드 · 클릭하면 복사</small>`;
     $('hostControls').style.display = isHost ? 'block':'none';
@@ -936,8 +970,9 @@
     if(list.length < 1) return;
     G.status='countdown';
     G.seed = Math.floor(Math.random()*2**31);
+    G.firstDone = false;
     G.participants = list.map(p=>p.id);
-    list.forEach(p=>{ p.grid=null; p.moves=0; p.progress=0; p.done=false; p.gaveUp=false; p.timeMs=null; });
+    list.forEach(p=>{ p.grid=null; p.moves=0; p.progress=0; p.done=false; p.gaveUp=false; p.stopped=false; p.timeMs=null; });
     hostSendAll({t:'countdown', seed:G.seed});
     beginCountdown(G.seed);
   });
@@ -946,7 +981,8 @@
   function beginCountdown(seed){
     if(countdownRunning) return;
     countdownRunning=true; phase='countdown';
-    finished=false; gaveUp=false; moves=0;
+    finished=false; gaveUp=false; stoppedEarly=false; moves=0;
+    $('firstBar').style.display='none';
     $('meLabel').textContent=myName;
     $('roomLabel').textContent='#'+roomCode;
     $('giveupBtn').style.display='block'; $('waitOthers').style.display='none';
@@ -992,14 +1028,15 @@
       const state = {
         t:'state', grid: grid?grid.flat():null, moves,
         progress: grid?correctCount():0,
-        done: finished, gaveUp,
-        timeMs: finished && !gaveUp ? (performance.now()-localStartTs) : null
+        done: finished, gaveUp, stopped: stoppedEarly,
+        timeMs: finished && !gaveUp && !stoppedEarly ? (performance.now()-localStartTs) : null
       };
       if(isHost){
         const p = G.players.get(myId);
         if(p){
           p.grid=state.grid; p.moves=state.moves; p.progress=state.progress;
-          if(state.done){ p.done=true; p.gaveUp=state.gaveUp; p.timeMs=state.timeMs; }
+          if(state.done){ p.done=true; p.gaveUp=state.gaveUp; p.stopped=state.stopped; p.timeMs=state.timeMs; }
+          hostCheckFirst();
           hostBroadcastGameThrottled();
           hostCheckEnd();
         }
@@ -1014,6 +1051,7 @@
 
   async function onFinish(){
     finished=true; stopClock(); releaseWake();
+    $('firstBar').style.display='none';
     sendMyState(true);
     $('giveupBtn').style.display='none';
     $('waitOthers').style.display='block';
@@ -1022,6 +1060,24 @@
   $('giveupBtn').addEventListener('click', ()=>{
     if(!confirm('정말 포기할까요? 기록은 DNF로 처리됩니다.')) return;
     gaveUp=true; finished=true; stopClock(); releaseWake();
+    $('firstBar').style.display='none';
+    sendMyState(true);
+    $('giveupBtn').style.display='none';
+    $('waitOthers').style.display='block';
+  });
+
+  // ───────────────── 1등 확정 배너 (계속 / 그만) ─────────────────
+  function applyFirst(msg){
+    if(phase!=='playing' || finished) return;   // 이미 완주/포기한 사람에겐 표시 안 함
+    $('firstBarText').innerHTML =
+      `🥇 <b>${escapeHtml(msg.name)}</b>님이 1등! (${fmtMs(msg.timeMs)})<br>계속 도전할까요?`;
+    $('firstBar').style.display='flex';
+  }
+  $('fbContinue').addEventListener('click', ()=>{ $('firstBar').style.display='none'; });
+  $('fbStop').addEventListener('click', ()=>{
+    if(phase!=='playing' || finished){ $('firstBar').style.display='none'; return; }
+    stoppedEarly=true; finished=true; stopClock(); releaseWake();
+    $('firstBar').style.display='none';
     sendMyState(true);
     $('giveupBtn').style.display='none';
     $('waitOthers').style.display='block';
@@ -1036,8 +1092,10 @@
     msg.players.forEach((p,i)=>{
       if(p.id===myId) return;
       const div = document.createElement('div');
-      div.className = 'mini' + (p.done ? (p.gaveUp?' dnf':' done') : '');
-      const stat = p.done ? (p.gaveUp?'DNF':fmtMs(p.timeMs)) : `${p.progress||0}/15 · ${p.moves||0}회`;
+      div.className = 'mini' + (p.done ? ((p.gaveUp||p.stopped)?' dnf':' done') : '');
+      const stat = p.done
+        ? (p.gaveUp ? 'DNF' : p.stopped ? `${p.progress||0}/15` : fmtMs(p.timeMs))
+        : `${p.progress||0}/15 · ${p.moves||0}회`;
       let html = `<div class="mini-head">
         <div class="avatar" style="background:${colors[i%4]}">${i+1}P</div>
         <div class="rname">${escapeHtml(p.name)}</div>
@@ -1048,7 +1106,7 @@
           if(n===0) html += `<div class="mini-cell blank"></div>`;
           else html += `<div class="mini-cell${n===idx+1?' ok':''}">${n}</div>`;
         });
-        if(p.done) html += `<div class="mini-badge${p.gaveUp?' dnf':''}">${p.gaveUp?'GIVE UP':'CLEAR!'}</div>`;
+        if(p.done) html += `<div class="mini-badge${(p.gaveUp||p.stopped)?' dnf':''}">${p.gaveUp?'GIVE UP':p.stopped?'STOP':'CLEAR!'}</div>`;
       } else {
         html += `<div class="mini-wait">화면 수신 대기중...</div>`;
       }
@@ -1061,19 +1119,25 @@
   // ───────────────── 결과 / 재경기 ─────────────────
   function applyResult(msg){
     phase='done'; stopClock(); releaseWake();
+    $('firstBar').style.display='none';
+    // 정렬: 완주(시간순) → 중도 종료(진행도 많은 순, 동률이면 이동 적은 순) → 기권(DNF)
+    const tier = p => p.gaveUp ? 2 : (p.stopped ? 1 : 0);
     const sorted = [...msg.list].sort((a,b)=>{
-      if(a.gaveUp && !b.gaveUp) return 1;
-      if(!a.gaveUp && b.gaveUp) return -1;
-      return (a.timeMs??Infinity)-(b.timeMs??Infinity);
+      const ta=tier(a), tb=tier(b);
+      if(ta!==tb) return ta-tb;
+      if(ta===0) return (a.timeMs??Infinity)-(b.timeMs??Infinity);
+      if(ta===1) return ((b.progress||0)-(a.progress||0)) || ((a.moves||0)-(b.moves||0));
+      return 0;
     });
     const medals=['🥇','🥈','🥉','4️⃣'];
     const list=$('rankList'); list.innerHTML='';
     sorted.forEach((p,i)=>{
       const row=document.createElement('div');
-      row.className='rank-row'+(i===0&&!p.gaveUp?' first':'')+(p.gaveUp?' dnf':'');
+      row.className='rank-row'+(i===0&&!p.gaveUp&&!p.stopped?' first':'')+(p.gaveUp?' dnf':'')+(p.stopped?' stop':'');
+      const rt = p.gaveUp ? 'DNF' : p.stopped ? `${p.progress||0}/15` : fmtMs(p.timeMs);
       row.innerHTML=`<div class="medal">${p.gaveUp?'❌':medals[i]||''}</div>
         <div class="rn">${escapeHtml(p.name)}${p.id===myId?' (나)':''}</div>
-        <div class="rt">${p.gaveUp?'DNF':fmtMs(p.timeMs)}</div>
+        <div class="rt">${rt}</div>
         <div class="rm">${p.moves||0}회</div>`;
       list.appendChild(row);
     });
@@ -1081,12 +1145,12 @@
     $('rematchWait').style.display = isHost?'none':'block';
     $('resultOverlay').classList.add('show');
     const winner=sorted[0];
-    if(winner && winner.id===myId && !winner.gaveUp) confetti(80);
+    if(winner && winner.id===myId && !winner.gaveUp && !winner.stopped) confetti(80);
   }
   $('rematchBtn').addEventListener('click', ()=>{
     if(!isHost) return;
-    G.status='lobby'; G.round++; G.participants=[];
-    G.players.forEach(p=>{ p.grid=null; p.moves=0; p.progress=0; p.done=false; p.gaveUp=false; p.timeMs=null; });
+    G.status='lobby'; G.round++; G.participants=[]; G.firstDone=false;
+    G.players.forEach(p=>{ p.grid=null; p.moves=0; p.progress=0; p.done=false; p.gaveUp=false; p.stopped=false; p.timeMs=null; });
     hostSendAll({t:'relobby'});
     enterLobbyUI();
   });
@@ -1095,7 +1159,8 @@
   function leave(){
     stopClock(); releaseWake(); netDestroy();
     roomCode=''; myId=''; myGid=''; isHost=false; phase='entry';
-    finished=false; gaveUp=false; countdownRunning=false; grid=null;
+    finished=false; gaveUp=false; stoppedEarly=false; countdownRunning=false; grid=null;
+    $('firstBar').style.display='none';
     lastLobby={players:[],maxPlayers:4};
     G.players.clear(); G.participants=[]; G.status='lobby'; guestSeq=0; pidToGid.clear();
     $('resultOverlay').classList.remove('show');
